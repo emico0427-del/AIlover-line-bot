@@ -218,7 +218,7 @@ app.post(
         if (/(だめ|ダメ|いや|嫌|やだ|無理|やめて)/i.test(t)) {
           nameMode = "chan";
           await lineReply(ev.replyToken, [
-            { type: "text", text: `分かった。気をつける。…でもつい呼びたくなるんだ、${getName()}。`, quickReply },
+            { type: "text", text: `俺もヤダ、${getName()}。`, quickReply },
           ]);
           continue;
         }
