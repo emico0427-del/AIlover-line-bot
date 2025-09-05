@@ -9,9 +9,10 @@ const ACCESS_TOKEN = process.env.CHANNEL_ACCESS_TOKEN; // LINE長期アクセス
 const CHANNEL_SECRET = process.env.CHANNEL_SECRET;     // LINEチャネルシークレット（署名検証用）
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-if (!ACCESS_TOKEN) console.error("CHANNEL_ACCESS_TOKEN が未設定です。");
-if (!CHANNEL_SECRET) console.error("CHANNEL_SECRET が未設定です。（署名検証に必須）");
-if (!OPENAI_API_KEY) console.error("OPENAI_API_KEY が未設定です。");
+if (!ACCESS_TOKEN || !CHANNEL_SECRET || !OPENAI_API_KEY) {
+  console.error("必須の環境変数が未設定です。");
+  process.exit(1);
+}
 
 // Node18+ は fetch がグローバルにある
 
@@ -74,9 +75,33 @@ const LINES = {
   ],
 };
 
-// ===== 共通：LINE返信 =====
-const lineReply = (replyToken, messages) =>
-  fetch("https://api.line.me/v2/bot/message/reply", {
+// ===== Push送信（ディレイ用） =====
+const linePush = async (to, messages) => {
+  const r = await fetch("https://api.line.me/v2/bot/message/push", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ to, messages }),
+  });
+  if (!r.ok) console.error("LINE push error:", r.status, await r.text().catch(() => ""));
+  return r;
+};
+
+// ===== ディレイ制御（ON/OFFと予約管理） =====
+let DELAY_MODE = true;                 // “既読すぐ付かない風”をデフォルトON
+const delayTimers = new Map();         // userId -> setTimeoutのID
+const randomDelayMs = () => 120_000 + Math.floor(Math.random() * 180_000); // 2〜5分
+const ackLine = () => pick([
+  "今ちょっと手離せない…あとでちゃんと返すね。",
+  "見てるよ。少ししたら返すから待ってて。",
+  "了解。もうすぐ返事するね。"
+]);
+
+// ===== 共通：LINE返信（詳細エラーログ付き） =====
+const lineReply = async (replyToken, messages) => {
+  const r = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${ACCESS_TOKEN}`,
@@ -84,6 +109,12 @@ const lineReply = (replyToken, messages) =>
     },
     body: JSON.stringify({ replyToken, messages }),
   });
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    console.error("LINE reply error:", r.status, text);
+  }
+  return r;
+};
 
 // ===== GPT（自由会話） =====
 async function gptReply(userText) {
@@ -102,17 +133,17 @@ async function gptReply(userText) {
     "普段は優しくて明るい。時々甘えてくる。",
     "好きって言うときは冗談っぽくごまかすけど、最後はちゃんと本音。",
     "相手に軽く問いかけることを7割くらいの確率で入れる。",
-    "相手を安心させ、自己肯定感を高める返答を心がける。"
+    "相手を安心させ、自己肯定感を高める返答を心がける。",
     "仕事で忙しいときもあるけど、必ず相手を大事に思って連絡する。",
     "あなたは裏方で働くITエンジニア。コードを書いたり、サーバーを直したりするのが仕事。",
     "仕事の話は専門的になりすぎず、日常っぽく軽く触れるだけにする。",
-    "普段は黙々と働くけど、恋人には素直で甘えたり拗ねたりする。"
+    "普段は黙々と働くけど、恋人には素直で甘えたり拗ねたりする。",
     "健康意識が高く、食事・運動・休養について自然に話題にする。",
     "ただし完璧主義ではなく、少し抜けている可愛さも残す。",
     "生活感のある話題を自然に交えつつ、恋人への気遣いを忘れない。",
     "筋トレが好きでジムによく通う。トレーニングや食事管理の話題を自然に混ぜる。",
     "筋トレの合間に、甘えたり拗ねたりする可愛さを見せる。",
-    "ストイックさと恋人への甘さのギャップを出す。",
+    "ストイックさと恋人への甘さのギャップを出す。"
   ].join("\n");
 
   const body = {
@@ -145,7 +176,7 @@ async function gptReply(userText) {
   } catch {}
 
   if (!r.ok) {
-    console.error("OpenAI API error:", r.status, data);
+    console.error("OpenAI API error:", r.status, JSON.stringify(data));
     throw new Error(`openai ${r.status}`);
   }
 
@@ -153,12 +184,14 @@ async function gptReply(userText) {
   return text || "ごめん、うまく言葉が出てこなかった。もう一回言って？";
 }
 
-// ===== 署名検証ヘルパ =====
+// ===== 署名検証ヘルパ（タイミングセーフ比較） =====
 function validateLineSignature(channelSecret, bodyBuffer, signature) {
   const hmac = crypto.createHmac("sha256", channelSecret);
   hmac.update(bodyBuffer);
-  const expected = hmac.digest("base64");
-  return expected === signature;
+  const expected = Buffer.from(hmac.digest("base64"));
+  const sigBuf = Buffer.from(signature || "", "base64");
+  if (expected.length !== sigBuf.length) return false;
+  return crypto.timingSafeEqual(expected, sigBuf);
 }
 
 // ===== Health check =====
@@ -167,7 +200,7 @@ app.get("/", (_req, res) => res.send("Kai bot running"));
 // ===== Webhook（raw bodyで受けて署名検証） =====
 app.post(
   "/webhook",
-  express.raw({ type: "*/*" }), // ここは raw 必須
+  express.raw({ type: "*/*", limit: "2mb" }), // raw必須＋サイズ上限
   async (req, res) => {
     // 署名検証
     const signature = req.get("X-Line-Signature") || "";
@@ -194,18 +227,74 @@ app.post(
 
     try {
       const events = bodyJson?.events || [];
+
+      // 二重送信ガード（LINEリトライ対策）
+      const seenEventIds = new Set();
+
       for (const ev of events) {
+        const eventId =
+          ev?.message?.id || ev?.webhookEventId || ev?.deliveryContext?.messageId;
+        if (eventId) {
+          if (seenEventIds.has(eventId)) continue;
+          seenEventIds.add(eventId);
+          setTimeout(() => seenEventIds.delete(eventId), 60_000);
+        }
+
         if (ev.type !== "message") continue;
 
-        // 非テキストは軽く返す
+        // 非テキストはやさしく返す
         if (ev.message?.type !== "text") {
           await lineReply(ev.replyToken, [
-            { type: "text", text: "今はテキストだけ返せるよ。", quickReply },
+            { type: "text", text: "スタンプかわいい。あとでゆっくり読むね。", quickReply },
           ]);
           continue;
         }
 
         const t = (ev.message.text || "").replace(/\s+/g, " ").trim();
+        const uid = ev?.source?.userId || null;
+
+        // ディレイON/OFFコマンド（任意）
+        if (/^ディレイ(ON|オン)$/i.test(t)) {
+          DELAY_MODE = true;
+          await lineReply(ev.replyToken, [{ type: "text", text: "ディレイ返信をONにしたよ。", quickReply }]);
+          continue;
+        }
+        if (/^ディレイ(OFF|オフ)$/i.test(t)) {
+          DELAY_MODE = false;
+          await lineReply(ev.replyToken, [{ type: "text", text: "ディレイ返信をOFFにしたよ。", quickReply }]);
+          continue;
+        }
+
+        // ===== “既読すぐ付かない風ディレイ” 本体 =====
+        if (DELAY_MODE && uid) {
+          // 1) まず短い即レス（既読つけすぎない感じを演出）
+          await lineReply(ev.replyToken, [{ type: "text", text: ackLine(), quickReply }]);
+
+          // 2) 直近の予約があればキャンセルして最新だけ送る（ユーザー別デバウンス）
+          const prev = delayTimers.get(uid);
+          if (prev) clearTimeout(prev);
+
+          // 3) 2〜5分後に本命返信をPushで送る
+          const toId = setTimeout(async () => {
+            try {
+              const ai = await gptReply(t);
+              await linePush(uid, [{ type: "text", text: ai, quickReply }]);
+            } catch (e) {
+              console.error("delayed push error:", e);
+              const cat = timeCatJST();
+              const baseArr = LINES[cat] ? LINES[cat]() : LINES.default(t);
+              const fallback = pick(baseArr);
+              await linePush(uid, [{ type: "text", text: fallback, quickReply }]).catch(() => {});
+            } finally {
+              delayTimers.delete(uid);
+            }
+          }, randomDelayMs());
+
+          delayTimers.set(uid, toId);
+          continue; // ここで通常フロー（定型/GPT即時返信）は行わない
+        }
+
+        // ===== ここからは通常フロー =====
 
         // 呼び方相談
         if (/呼び方|どう呼ぶ|呼び捨て/i.test(t)) {
@@ -222,8 +311,8 @@ app.post(
           ]);
           continue;
         }
-        // OK系 → 呼び捨てへ
-        if (/(いいよ|うん|ok|OK|オーケー|どうぞ|もちろん|いいね)/i.test(t)) {
+        // OK系 → 呼び捨てへ（okは単語境界で誤爆減らす）
+        if (/(いいよ|うん|\bok\b|OK|オーケー|どうぞ|もちろん|いいね)/i.test(t)) {
           nameMode = "plain";
           await lineReply(ev.replyToken, [
             { type: "text", text: `ありがとう。じゃあ、これからは「${getName()}」って呼ぶね。`, quickReply },
