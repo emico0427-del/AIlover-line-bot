@@ -171,25 +171,32 @@ app.get("/webhook", (_req, res) => res.status(200).send("OK"));
 // ===== Webhook（rawで受けるのが超重要） =====
 app.post(
   "/webhook",
-  express.raw({ type: "*/*", limit: "2mb" }), // Content-Typeの揺れを吸収
+  // ★ここを "*/*" から "application/json" に変更
+  express.raw({ type: "application/json", limit: "2mb" }),
   async (req, res) => {
-    // ① まず即200（検証/リトライ対策）
+    // 署名検証
+    const signature = req.get("x-line-signature") || "";
+    const okSig = validateLineSignature(CHANNEL_SECRET, req.body, signature);
+    if (!okSig) {
+      console.error("Invalid signature");
+      return res.status(403).send("Invalid signature");
+    }
+
+    // OKを即返す（以降は非同期処理）
     res.status(200).end();
 
-    // ② 署名検証（NGなら処理スキップ）
-    const signature = req.get("x-line-signature") || req.get("X-Line-Signature") || "";
-    const okSig = CHANNEL_SECRET
-      ? validateLineSignature(CHANNEL_SECRET, req.body, signature)
-      : false;
-    if (!okSig) {
-      console.error("Invalid signature (skip processing)");
+    // ここから先は今までの処理（JSON.parse して events を回す etc...）
+    let bodyJson = {};
+    try {
+      bodyJson = JSON.parse(req.body.toString("utf8"));
+    } catch (e) {
+      console.error("JSON parse error:", e);
       return;
     }
 
-    // ③ JSONへ
-    let bodyJson = {};
-    try { bodyJson = JSON.parse(req.body.toString("utf8")); }
-    catch (e) { console.error("JSON parse error:", e); return; }
+    // ...（以降はあなたのロジックのまま）
+  }
+);
 
     // ④ イベント処理
     try {
