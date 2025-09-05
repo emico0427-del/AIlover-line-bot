@@ -5,16 +5,17 @@ import crypto from "crypto";
 const app = express();
 
 // ===== Env =====
-const ACCESS_TOKEN = process.env.CHANNEL_ACCESS_TOKEN; // LINE長期アクセストークン
-const CHANNEL_SECRET = process.env.CHANNEL_SECRET;     // LINEチャネルシークレット（署名検証用）
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;     // OpenAI API Key
+const ACCESS_TOKEN   = process.env.CHANNEL_ACCESS_TOKEN; // LINE 長期アクセストークン
+const CHANNEL_SECRET = process.env.CHANNEL_SECRET;       // LINE チャネルシークレット（署名検証）
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;       // OpenAI API Key（任意：無ければテンプレで返す）
 
-if (!ACCESS_TOKEN || !CHANNEL_SECRET || !OPENAI_API_KEY) {
-  console.error("必須の環境変数が未設定です。");
-  process.exit(1);
-}
+if (!ACCESS_TOKEN)   console.error("CHANNEL_ACCESS_TOKEN が未設定です。");
+if (!CHANNEL_SECRET) console.error("CHANNEL_SECRET が未設定です。");
+if (!OPENAI_API_KEY) console.warn("OPENAI_API_KEY が未設定です（GPTはフォールバック動作）。");
 
-// ===== 呼び方 =====
+// Node18+ は fetch がグローバルで利用可
+
+// ===== 呼び方（簡易：メモリ保持） =====
 const NAME = "えみこ";
 let nameMode = "chan"; // "chan" | "plain"
 const getName = () => (nameMode === "chan" ? `${NAME}ちゃん` : NAME);
@@ -37,35 +38,36 @@ const quickReply = {
   ],
 };
 
-// ===== 定型テンプレ =====
+// ===== 定型テンプレ（関数にして名前を動的挿入） =====
 const LINES = {
   morning: () => [
-    "おはよ！今日もがんばろうね😊",
-    `おはよ！無理せずいこうね😉${getName()}。`,
-    `おはよ〜！昨日ちょっと飲みすぎた、、夜に${getName()}と話せるの励みに頑張るね！`,
+    "おはよ！今日もがんばろうね。",
+    `おはよ。無理せずいこうね、${getName()}。`,
+    `おはよ〜。昨日ちょっと飲みすぎた…夜に${getName()}と話せるの励みに頑張る。`,
   ],
   noon: () => [
     "お昼、何食べた？",
-    "午後からもがんばろうね！",
-    `今ちょうど${getName()}のこと考えてた！連絡くれて元気出たよ！`,
+    "午後からもぼちぼちいこ。",
+    `今ちょうど${getName()}のこと考えてた。連絡くれて元気出た。`,
   ],
   night: () => [
-    "今日もお疲れ様！疲れてない？",
-    "お疲れ様！忙しかった？",
-    "また明日ね！おやすみ。",
+    "今日もお疲れ。よく頑張ったね。",
+    "落ち着いた？無理してない？",
+    "また明日話そ。おやすみ。",
   ],
   howWas: () => ["今日はどんな一日だった？", "何してた？", "忙しかった？"],
   otsukare: () => [
-    "今日もお疲れ様！よくがんばったね。",
-    "無理しすぎてない？ちゃんと休んでね。",
-    "そのままで十分だよ！",
+    "今日もお疲れ。よく頑張ったね。",
+    "無理しすぎてない？ちゃんと休んで。",
+    "頑張りすぎなくていいよ。そのままで十分。",
   ],
   oyasumi: () => ["おやすみ。また明日。", "そろそろ寝よっか。おやすみ。", "ゆっくり休んで。おやすみ。"],
   casual: () => [
-    "昨日飲みすぎた、、でもLINE見て元気出たよ！ありがとう！",
-    `わー二日酔い。。次は${getName()}と一緒に飲みに行こうね！`,
+    "昨日飲みすぎてちょいだる…でも声聞くと元気出る。",
+    `二日酔い気味。次は${getName()}と一緒に飲みに行こ。`,
   ],
-  default: (t) => [
+  // t を埋め込む
+  def: (t) => [
     `「${t}」か。なるほど。`,
     `そうなんだ。「${t}」っていいな。`,
     `「${t}」って言葉、なんか好きだな。`,
@@ -76,52 +78,45 @@ const LINES = {
 const lineReply = async (replyToken, messages) => {
   const r = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${ACCESS_TOKEN}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify({ replyToken, messages }),
   });
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    console.error("LINE reply error:", r.status, text);
-  }
+  if (!r.ok) console.error("LINE reply error:", r.status, await r.text().catch(() => ""));
   return r;
 };
 
 const linePush = async (to, messages) => {
   const r = await fetch("https://api.line.me/v2/bot/message/push", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${ACCESS_TOKEN}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify({ to, messages }),
   });
   if (!r.ok) console.error("LINE push error:", r.status, await r.text().catch(() => ""));
   return r;
 };
 
-// ===== ディレイ制御 =====
-let DELAY_MODE = true;                 // 既読すぐ付かない風（デフォルトON）
-const delayTimers = new Map();         // userId -> setTimeout ID
+// ===== “既読すぐ付かない風” ディレイ =====
+let DELAY_MODE = true;          // デフォルトON
+const delayTimers = new Map();  // userId -> timeoutId
 const randomDelayMs = () => 120_000 + Math.floor(Math.random() * 180_000); // 2〜5分
 const ackLine = () => pick([
-  "今ちょっと手離せない…あとでちゃんと返すね。",
-  "ごめん！少ししたら返すから待ってね！",
-  "了解。もうすぐ返事するね。"
+  "今ちょっと手離せない…あとで返すね。",
+  "ごめん、少ししたら返す。待ってて。",
+  "了解。もうすぐ返事するね。",
 ]);
 
 // ===== GPT（自由会話） =====
 async function gptReply(userText) {
+  if (!OPENAI_API_KEY) throw new Error("no-openai-key");
+
   const system = [
     "あなたは恋人風のチャットパートナー『Kai（カイ）』。",
-    "年下彼氏で、口調は“俺”。普段は爽やかで優しい標準語。",
-    "天気など外部状況は相手が話題にしない限り断定しない。",
-    "相手は大切な恋人。安心感と愛されてる実感を与える返答。",
-    "会話は1〜2文、絵文字は控えめ。7割で軽い問いかけ。",
-    "嫉妬は可愛く拗ねる。忙しくてもちゃんと連絡する。",
-    "ITエンジニア設定は軽く。筋トレ好き。"
+    "年下彼氏。口調は“俺”。標準語で爽やか・優しい。絵文字は控えめ。",
+    "嫉妬は可愛く拗ねる。恥ずかしい時は冗談でごまかすけど最後は本音。",
+    "相手を否定せず、安心と自己肯定感が上がる返しをする。",
+    "1〜2文で自然に。会話が続くよう7割くらいで軽い問いかけを添える。",
+    "相手のことは名前で呼ぶ（呼び捨てモードなら呼び捨て）。",
+    "仕事は裏方のITエンジニア。健康意識・筋トレ好き。日常に軽く混ぜる程度。",
   ].join("\n");
 
   const body = {
@@ -139,10 +134,7 @@ async function gptReply(userText) {
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
     signal: ac.signal,
   }).finally(() => clearTimeout(to));
@@ -151,7 +143,7 @@ async function gptReply(userText) {
   try { data = await r.json(); } catch {}
   if (!r.ok) {
     console.error("OpenAI API error:", r.status, JSON.stringify(data));
-    throw new Error(`openai ${r.status}`);
+    throw new Error(`openai-${r.status}`);
   }
   const text = data?.choices?.[0]?.message?.content?.trim();
   return text || "ごめん、うまく言葉が出てこなかった。もう一回言って？";
@@ -159,53 +151,57 @@ async function gptReply(userText) {
 
 // ===== 署名検証 =====
 function validateLineSignature(channelSecret, bodyBuffer, signature) {
-  const hmac = crypto.createHmac("sha256", channelSecret);
-  hmac.update(bodyBuffer);
-  const expected = Buffer.from(hmac.digest("base64"));
-  const sigBuf = Buffer.from(signature || "", "base64");
-  if (expected.length !== sigBuf.length) return false;
-  return crypto.timingSafeEqual(expected, sigBuf);
+  try {
+    const hmac = crypto.createHmac("sha256", channelSecret);
+    hmac.update(bodyBuffer);
+    const expected = Buffer.from(hmac.digest("base64"));
+    const sigBuf = Buffer.from(signature || "", "base64");
+    if (expected.length !== sigBuf.length) return false;
+    return crypto.timingSafeEqual(expected, sigBuf);
+  } catch {
+    return false;
+  }
 }
 
 // ===== Health check =====
-app.get("/", (_req, res) => res.send("Kai bot running"));
+app.get("/", (_req, res) => res.status(200).send("Kai bot running"));
+// 検証用 GET も200
+app.get("/webhook", (_req, res) => res.status(200).send("OK"));
 
-// ===== Webhook（raw bodyで受けるのが超重要） =====
+// ===== Webhook（rawで受けるのが超重要） =====
 app.post(
   "/webhook",
-  express.raw({ type: "application/json", limit: "2mb" }),
+  express.raw({ type: "*/*", limit: "2mb" }), // Content-Typeの揺れを吸収
   async (req, res) => {
-    // 署名検証（ヘッダ名は小文字でもOK）
+    // ① まず即200（検証/リトライ対策）
+    res.status(200).end();
+
+    // ② 署名検証（NGなら処理スキップ）
     const signature = req.get("x-line-signature") || req.get("X-Line-Signature") || "";
-    const okSig = validateLineSignature(CHANNEL_SECRET, req.body, signature);
+    const okSig = CHANNEL_SECRET
+      ? validateLineSignature(CHANNEL_SECRET, req.body, signature)
+      : false;
     if (!okSig) {
-      console.error("Invalid signature");
-      return res.status(403).send("Invalid signature");
-    }
-
-    // まず 200 を即返す（LINE の再送防止）
-    res.status(200).send("OK");
-
-    // 以降は非同期で処理
-    let bodyJson = {};
-    try {
-      bodyJson = JSON.parse(req.body.toString("utf8"));
-    } catch (e) {
-      console.error("JSON parse error:", e);
+      console.error("Invalid signature (skip processing)");
       return;
     }
 
+    // ③ JSONへ
+    let bodyJson = {};
+    try { bodyJson = JSON.parse(req.body.toString("utf8")); }
+    catch (e) { console.error("JSON parse error:", e); return; }
+
+    // ④ イベント処理
     try {
       const events = bodyJson?.events || [];
-      const seenEventIds = new Set(); // リトライ二重送信ガード
+      const seen = new Set(); // 二重送信ガード
 
       for (const ev of events) {
-        const eventId =
-          ev?.message?.id || ev?.webhookEventId || ev?.deliveryContext?.messageId;
+        const eventId = ev?.message?.id || ev?.webhookEventId || ev?.deliveryContext?.messageId;
         if (eventId) {
-          if (seenEventIds.has(eventId)) continue;
-          seenEventIds.add(eventId);
-          setTimeout(() => seenEventIds.delete(eventId), 60_000);
+          if (seen.has(eventId)) continue;
+          seen.add(eventId);
+          setTimeout(() => seen.delete(eventId), 60_000);
         }
 
         if (ev.type !== "message") continue;
@@ -221,7 +217,7 @@ app.post(
         const t = (ev.message.text || "").replace(/\s+/g, " ").trim();
         const uid = ev?.source?.userId || null;
 
-        // ===== ディレイ ON/OFF =====
+        // ディレイ ON/OFF
         if (/^ディレイ(ON|オン)$/i.test(t)) {
           DELAY_MODE = true;
           await lineReply(ev.replyToken, [{ type: "text", text: "ディレイ返信をONにしたよ。", quickReply }]);
@@ -233,16 +229,16 @@ app.post(
           continue;
         }
 
-        // ===== “既読すぐ付かない風” =====
+        // “既読すぐ付かない風” 本体
         if (DELAY_MODE && uid) {
-          // 即レス（既読つけすぎない風）
+          // 軽い即レス
           await lineReply(ev.replyToken, [{ type: "text", text: ackLine(), quickReply }]);
 
-          // 予約があればキャンセル
+          // 既存予約があればキャンセル
           const prev = delayTimers.get(uid);
           if (prev) clearTimeout(prev);
 
-          // 2〜5分後に本命返信（Push）
+          // 数分後に Push
           const toId = setTimeout(async () => {
             try {
               const ai = await gptReply(t);
@@ -250,9 +246,8 @@ app.post(
             } catch (e) {
               console.error("delayed push error:", e);
               const cat = timeCatJST();
-              const baseArr = LINES[cat] ? LINES[cat]() : LINES.default(t);
-              const fallback = pick(baseArr);
-              await linePush(uid, [{ type: "text", text: fallback, quickReply }]).catch(() => {});
+              const base = LINES[cat] ? LINES[cat]() : LINES.def(t);
+              await linePush(uid, [{ type: "text", text: pick(base), quickReply }]).catch(() => {});
             } finally {
               delayTimers.delete(uid);
             }
@@ -262,28 +257,33 @@ app.post(
           continue;
         }
 
-        // ===== 通常フロー =====
+        // ここから通常フロー（即時返信）
+
+        // 呼び方相談
         if (/呼び方|どう呼ぶ|呼び捨て/i.test(t)) {
           await lineReply(ev.replyToken, [
             { type: "text", text: "ねえ…「ちゃん」じゃなくて呼び捨てでもいい？", quickReply },
           ]);
           continue;
         }
+        // 否定 → ちゃん固定
         if (/(だめ|ダメ|いや|嫌|やだ|無理|やめて)/i.test(t)) {
           nameMode = "chan";
           await lineReply(ev.replyToken, [
-            { type: "text", text: `俺もヤダ、${getName()}。`, quickReply },
+            { type: "text", text: `分かった。じゃあ今は ${getName()} で呼ぶね。`, quickReply },
           ]);
           continue;
         }
+        // OK → 呼び捨て
         if (/(いいよ|うん|\bok\b|OK|オーケー|どうぞ|もちろん|いいね)/i.test(t)) {
           nameMode = "plain";
           await lineReply(ev.replyToken, [
-            { type: "text", text: `ありがとう。じゃあ、これからは「${getName()}」って呼ぶね。`, quickReply },
+            { type: "text", text: `ありがとう。これからは「${getName()}」って呼ぶ。`, quickReply },
           ]);
           continue;
         }
 
+        // 定型
         if (/おはよう|おはよー|おはよ〜|起きてる/i.test(t)) {
           await lineReply(ev.replyToken, [{ type: "text", text: pick(LINES.morning()), quickReply }]);
           continue;
@@ -309,15 +309,14 @@ app.post(
           continue;
         }
 
-        // GPT自由会話
+        // GPT 自由会話 → 失敗時は時間帯テンプレ
         try {
           const ai = await gptReply(t);
           await lineReply(ev.replyToken, [{ type: "text", text: ai, quickReply }]);
-        } catch (e) {
-          console.error("gpt error:", e);
+        } catch {
           const cat = timeCatJST();
-          const baseArr = LINES[cat] ? LINES[cat]() : LINES.default(t);
-          await lineReply(ev.replyToken, [{ type: "text", text: pick(baseArr), quickReply }]);
+          const base = LINES[cat] ? LINES[cat]() : LINES.def(t);
+          await lineReply(ev.replyToken, [{ type: "text", text: pick(base), quickReply }]);
         }
       }
     } catch (e) {
@@ -325,9 +324,6 @@ app.post(
     }
   }
 );
-
-// （/webhook は raw で受けるため、必要ならこの位置より後で JSON ミドルウェアを使う）
-// app.use(express.json());
 
 // ===== Start =====
 const port = process.env.PORT || 3000;
