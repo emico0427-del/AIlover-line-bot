@@ -379,3 +379,10 @@ app.post(
 // ===== Start =====
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Server running on " + port));
+
+// ★ bodyParserの前後どちらでも動きます。重複ルートにはなりません。
+app.all("/webhook", (req, res, next) => {
+  if (req.method !== "POST") return res.status(200).send("OK");
+  res.status(200).send("OK");
+  next?.();
+});
