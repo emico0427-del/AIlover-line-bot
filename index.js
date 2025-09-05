@@ -5,22 +5,22 @@ import crypto from "crypto";
 const app = express();
 
 // ===== Env =====
-const ACCESS_TOKEN   = process.env.CHANNEL_ACCESS_TOKEN; // LINE 長期アクセストークン
-const CHANNEL_SECRET = process.env.CHANNEL_SECRET;       // LINE チャネルシークレット（署名検証）
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;       // OpenAI API Key（任意：無ければテンプレで返す）
+const ACCESS_TOKEN   = process.env.CHANNEL_ACCESS_TOKEN; // Messaging API の「チャネルアクセストークン（長期）」
+const CHANNEL_SECRET = process.env.CHANNEL_SECRET;       // Messaging API の「チャネルシークレット」
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;       // OpenAI（任意。未設定ならテンプレ返信）
 
 if (!ACCESS_TOKEN)   console.error("CHANNEL_ACCESS_TOKEN が未設定です。");
 if (!CHANNEL_SECRET) console.error("CHANNEL_SECRET が未設定です。");
 if (!OPENAI_API_KEY) console.warn("OPENAI_API_KEY が未設定です（GPTはフォールバック動作）。");
 
-// Node18+ は fetch がグローバルで利用可
+// Node18+ は fetch がグローバルで利用可能
 
-// ===== 呼び方（簡易：メモリ保持） =====
+// ===== 呼び方（簡易） =====
 const NAME = "えみこ";
 let nameMode = "chan"; // "chan" | "plain"
 const getName = () => (nameMode === "chan" ? `${NAME}ちゃん` : NAME);
 
-// ===== Utility =====
+// ===== Util =====
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const timeCatJST = () => {
   const h = (new Date().getUTCHours() + 9) % 24;
@@ -38,7 +38,7 @@ const quickReply = {
   ],
 };
 
-// ===== 定型テンプレ（関数にして名前を動的挿入） =====
+// ===== 定型文 =====
 const LINES = {
   morning: () => [
     "おはよ！今日もがんばろうね。",
@@ -66,7 +66,6 @@ const LINES = {
     "昨日飲みすぎてちょいだる…でも声聞くと元気出る。",
     `二日酔い気味。次は${getName()}と一緒に飲みに行こ。`,
   ],
-  // t を埋め込む
   def: (t) => [
     `「${t}」か。なるほど。`,
     `そうなんだ。「${t}」っていいな。`,
@@ -84,7 +83,6 @@ const lineReply = async (replyToken, messages) => {
   if (!r.ok) console.error("LINE reply error:", r.status, await r.text().catch(() => ""));
   return r;
 };
-
 const linePush = async (to, messages) => {
   const r = await fetch("https://api.line.me/v2/bot/message/push", {
     method: "POST",
@@ -96,7 +94,7 @@ const linePush = async (to, messages) => {
 };
 
 // ===== “既読すぐ付かない風” ディレイ =====
-let DELAY_MODE = true;          // デフォルトON
+let DELAY_MODE = true;          // 既定 ON
 const delayTimers = new Map();  // userId -> timeoutId
 const randomDelayMs = () => 120_000 + Math.floor(Math.random() * 180_000); // 2〜5分
 const ackLine = () => pick([
@@ -165,27 +163,25 @@ function validateLineSignature(channelSecret, bodyBuffer, signature) {
 
 // ===== Health check =====
 app.get("/", (_req, res) => res.status(200).send("Kai bot running"));
-// 検証用 GET も200
-app.get("/webhook", (_req, res) => res.status(200).send("OK"));
+app.get("/webhook", (_req, res) => res.status(200).send("OK")); // LINEの検証用GETも200
 
-// ===== Webhook（rawで受けるのが超重要） =====
+// ===== Webhook（★raw で受けるのが超重要） =====
 app.post(
   "/webhook",
-  // ★ここを "*/*" から "application/json" に変更
   express.raw({ type: "application/json", limit: "2mb" }),
   async (req, res) => {
     // 署名検証
     const signature = req.get("x-line-signature") || "";
     const okSig = validateLineSignature(CHANNEL_SECRET, req.body, signature);
     if (!okSig) {
-      console.error("Invalid signature");
+      console.error("Invalid signature (skip processing)");
       return res.status(403).send("Invalid signature");
     }
 
-    // OKを即返す（以降は非同期処理）
+    // 即200（タイムアウト & 再送防止）
     res.status(200).end();
 
-    // ここから先は今までの処理（JSON.parse して events を回す etc...）
+    // JSONにパース
     let bodyJson = {};
     try {
       bodyJson = JSON.parse(req.body.toString("utf8"));
@@ -194,11 +190,7 @@ app.post(
       return;
     }
 
-    // ...（以降はあなたのロジックのまま）
-  }
-);
-
-    // ④ イベント処理
+    // ===== イベント処理 =====
     try {
       const events = bodyJson?.events || [];
       const seen = new Set(); // 二重送信ガード
@@ -238,14 +230,11 @@ app.post(
 
         // “既読すぐ付かない風” 本体
         if (DELAY_MODE && uid) {
-          // 軽い即レス
           await lineReply(ev.replyToken, [{ type: "text", text: ackLine(), quickReply }]);
 
-          // 既存予約があればキャンセル
           const prev = delayTimers.get(uid);
           if (prev) clearTimeout(prev);
 
-          // 数分後に Push
           const toId = setTimeout(async () => {
             try {
               const ai = await gptReply(t);
@@ -264,16 +253,13 @@ app.post(
           continue;
         }
 
-        // ここから通常フロー（即時返信）
-
-        // 呼び方相談
+        // 通常フロー
         if (/呼び方|どう呼ぶ|呼び捨て/i.test(t)) {
           await lineReply(ev.replyToken, [
             { type: "text", text: "ねえ…「ちゃん」じゃなくて呼び捨てでもいい？", quickReply },
           ]);
           continue;
         }
-        // 否定 → ちゃん固定
         if (/(だめ|ダメ|いや|嫌|やだ|無理|やめて)/i.test(t)) {
           nameMode = "chan";
           await lineReply(ev.replyToken, [
@@ -281,7 +267,6 @@ app.post(
           ]);
           continue;
         }
-        // OK → 呼び捨て
         if (/(いいよ|うん|\bok\b|OK|オーケー|どうぞ|もちろん|いいね)/i.test(t)) {
           nameMode = "plain";
           await lineReply(ev.replyToken, [
@@ -290,7 +275,6 @@ app.post(
           continue;
         }
 
-        // 定型
         if (/おはよう|おはよー|おはよ〜|起きてる/i.test(t)) {
           await lineReply(ev.replyToken, [{ type: "text", text: pick(LINES.morning()), quickReply }]);
           continue;
@@ -316,7 +300,7 @@ app.post(
           continue;
         }
 
-        // GPT 自由会話 → 失敗時は時間帯テンプレ
+        // GPT 自由会話（失敗時は時間帯テンプレ）
         try {
           const ai = await gptReply(t);
           await lineReply(ev.replyToken, [{ type: "text", text: ai, quickReply }]);
