@@ -12,14 +12,33 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;       // 任意（無いと�
 if (!ACCESS_TOKEN)   console.error("CHANNEL_ACCESS_TOKEN が未設定です。");
 if (!CHANNEL_SECRET) console.error("CHANNEL_SECRET が未設定です。");
 
-// ===== ちょいユーティリティ =====
+// ===== 小物 =====
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// ===== ユーザーごとの設定記憶 =====
+const userPrefs = new Map(); // userId -> { nickname, mode }
+const getNickname = (uid) => userPrefs.get(uid)?.nickname || "あなた";
+const getCallName = (uid) => {
+  const pref = userPrefs.get(uid);
+  if (!pref) return "あなた";
+  return pref.mode === "plain"
+    ? pref.nickname.replace(/(ちゃん|さん|くん)$/,"")
+    : pref.nickname;
+};
+
+// ===== LINE プロフィール取得 =====
+async function fetchLineProfile(userId) {
+  const r = await fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}` }
+  });
+  if (!r.ok) return null;
+  return r.json();
+}
 
 // ===== 署名検証 =====
 function validateLineSignature(channelSecret, bodyBuffer, signatureBase64) {
   try {
     const mac = crypto.createHmac("sha256", channelSecret).update(bodyBuffer).digest("base64");
-    // 文字列比較を timing safe に
     const a = Buffer.from(mac);
     const b = Buffer.from(signatureBase64 || "", "base64").toString("base64");
     const c = Buffer.from(b);
@@ -29,7 +48,7 @@ function validateLineSignature(channelSecret, bodyBuffer, signatureBase64) {
   }
 }
 
-// ===== LINE返信（Reply） =====
+// ===== LINE API =====
 async function lineReply(replyToken, messages) {
   const r = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
@@ -42,8 +61,30 @@ async function lineReply(replyToken, messages) {
   if (!r.ok) console.error("LINE reply error:", r.status, await r.text().catch(() => ""));
 }
 
-// ===== GPT（任意） =====
-async function gptReply(userText) {
+async function linePush(to, messages) {
+  const r = await fetch("https://api.line.me/v2/bot/message/push", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ to, messages }),
+  });
+  if (!r.ok) console.error("LINE push error:", r.status, await r.text().catch(() => ""));
+}
+
+// ===== ディレイ返信（既読すぐ付かない風） =====
+let DELAY_MODE = true;                 // デフォルトON
+const delayTimers = new Map();         // userId -> timeoutId
+const randomDelayMs = () => 120_000 + Math.floor(Math.random() * 180_000); // 2〜5分
+const ackLine = (uid) => pick([
+  `今ちょっと手離せない…あとで返すね。`,
+  `ごめん！少ししたら返す。待ってて、${getCallName(uid)}。`,
+  `了解！もうすぐ返事するね。`
+]);
+
+// ===== GPT（会話AI） =====
+async function gptReply(userText, ctx = {}) {
   if (!OPENAI_API_KEY) {
     return pick([
       "なるほど。もう少し詳しく教えて？",
@@ -51,22 +92,26 @@ async function gptReply(userText) {
       "そっか。無理しすぎないでね。",
     ]);
   }
+
   const system = [
-    "あなたは恋人風のチャットパートナー『Kai（カイ）』。",
-    "年下彼氏。口調は“俺”。標準語で爽やか・優しい。絵文字は控えめ。",
-    "1〜2文で自然に返す。軽い問いかけを添えることが多い。",
-    "相手は大切な恋人。安心感を与え、否定しない。",
+    "あなたは恋人風の『Kai（カイ）』。年下彼氏で口調は“俺”。標準語、1〜2文、絵文字控えめ。",
+    "相手は恋人。安心させつつ、可愛く拗ねたり冗談で照れることもある。否定しない。",
+    "必ず相手の呼び名（例: えみちゃん / えみこ）を自然に入れる。"
   ].join("\n");
 
   const body = {
     model: "gpt-4o-mini",
     messages: [
       { role: "system", content: system },
-      { role: "user", content: userText },
+      { role: "user", content: `相手の呼び名: ${ctx.callName || "あなた"}\nユーザーの発言: ${userText}` },
     ],
     temperature: 0.7,
     max_tokens: 160,
   };
+
+  // タイムアウト付き fetch
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 10_000);
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -75,13 +120,14 @@ async function gptReply(userText) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
-  });
+    signal: ac.signal,
+  }).finally(() => clearTimeout(timer));
 
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
     console.error("OpenAI API error:", r.status, data);
     return "ごめん、今ちょっと上手く考えがまとまらない。また聞かせて？";
-  }
+    }
   return data?.choices?.[0]?.message?.content?.trim()
       || "うまく言葉が出てこなかった。もう一回言って？";
 }
@@ -90,12 +136,11 @@ async function gptReply(userText) {
 app.get("/", (_req, res) => res.status(200).send("Kai bot running"));
 app.get("/webhook", (_req, res) => res.status(200).send("OK")); // 検証用GET
 
-// ===== Webhook（※絶対に raw） =====
+// ===== Webhook =====
 app.post(
   "/webhook",
   express.raw({ type: "application/json", limit: "2mb" }),
   async (req, res) => {
-    // 署名検証
     const signature = req.get("x-line-signature") || req.get("X-Line-Signature") || "";
     const okSig = validateLineSignature(CHANNEL_SECRET, req.body, signature);
     if (!okSig) {
@@ -103,10 +148,8 @@ app.post(
       return res.status(403).send("Invalid signature");
     }
 
-    // 即 200
     res.status(200).end();
 
-    // JSON へ
     let bodyJson = {};
     try {
       bodyJson = JSON.parse(req.body.toString("utf8"));
@@ -115,13 +158,21 @@ app.post(
       return;
     }
 
-    // ===== イベント処理 =====
     try {
       const events = bodyJson.events || [];
       for (const ev of events) {
         if (ev.type !== "message") continue;
 
-        // テキスト以外は簡単に返す
+        const uid = ev?.source?.userId;
+
+        // 初回は表示名メモ
+        if (uid && !userPrefs.has(uid)) {
+          const prof = await fetchLineProfile(uid).catch(()=>null);
+          const display = prof?.displayName || "あなた";
+          userPrefs.set(uid, { nickname: display, mode: "chan" });
+        }
+
+        // 非テキストは軽く返す
         if (ev.message?.type !== "text") {
           await lineReply(ev.replyToken, [{ type: "text", text: "今はテキストだけ読めるよ！" }]);
           continue;
@@ -129,22 +180,88 @@ app.post(
 
         const t = (ev.message.text || "").trim();
 
-        // かんたん定型
-        if (/おはよ|おはよう/i.test(t)) {
-          await lineReply(ev.replyToken, [{ type: "text", text: "おはよう。今日もがんばろうね。" }]);
+        // ===== ディレイ切替 =====
+        if (/^ディレイ\s*(ON|オン)$/i.test(t)) {
+          DELAY_MODE = true;
+          await lineReply(ev.replyToken, [{ type:"text", text:"ディレイ返信をONにしたよ。"}]);
           continue;
         }
-        if (/おつかれ|お疲れ/i.test(t)) {
-          await lineReply(ev.replyToken, [{ type: "text", text: "お疲れさま。無理しすぎないでね。" }]);
-          continue;
-        }
-        if (/おやすみ/i.test(t)) {
-          await lineReply(ev.replyToken, [{ type: "text", text: "おやすみ。ゆっくり休んでね。" }]);
+        if (/^ディレイ\s*(OFF|オフ)$/i.test(t)) {
+          DELAY_MODE = false;
+          await lineReply(ev.replyToken, [{ type:"text", text:"ディレイ返信をOFFにしたよ。"}]);
           continue;
         }
 
-        // GPT or フォールバック
-        const ai = await gptReply(t);
+        // ===== 名前関連 =====
+        if (/私の名前(は|って)/i.test(t) && uid) {
+          await lineReply(ev.replyToken, [{ type:"text", text:`${getCallName(uid)} だよ。忘れない。` }]);
+          continue;
+        }
+        if (uid && /(呼んで|呼び方)/.test(t)) {
+          const m1 = t.match(/(.*?)(で呼んで|って呼んで)/);
+          if (m1 && m1[1].trim()) {
+            const nick = m1[1].trim();
+            const pref = userPrefs.get(uid) || {};
+            userPrefs.set(uid, { ...pref, nickname: nick });
+            await lineReply(ev.replyToken, [{ type:"text", text:`了解。これからは「${getCallName(uid)}」って呼ぶね。` }]);
+            continue;
+          }
+        }
+        if (uid && /(呼び捨て|よびすて)/i.test(t)) {
+          const pref = userPrefs.get(uid) || {};
+          userPrefs.set(uid, { ...pref, mode:"plain" });
+          await lineReply(ev.replyToken, [{ type:"text", text:`じゃあ呼び捨てでいくね、${getCallName(uid)}。` }]);
+          continue;
+        }
+        if (uid && /(ちゃん付け|ちゃんで)/i.test(t)) {
+          const pref = userPrefs.get(uid) || {};
+          userPrefs.set(uid, { ...pref, mode:"chan" });
+          await lineReply(ev.replyToken, [{ type:"text", text:`了解。可愛く呼ぶね、${getCallName(uid)}。` }]);
+          continue;
+        }
+
+        // ===== ディレイ本体 =====
+        if (DELAY_MODE && uid) {
+          // 1) まず軽い即レス
+          await lineReply(ev.replyToken, [{ type:"text", text: ackLine(uid) }]);
+
+          // 2) 既存予約をキャンセル
+          const prev = delayTimers.get(uid);
+          if (prev) clearTimeout(prev);
+
+          // 3) 2〜5分後に本命返信（Push）
+          const toId = setTimeout(async () => {
+            try {
+              const ai = await gptReply(t, { callName: getCallName(uid) });
+              await linePush(uid, [{ type: "text", text: ai }]);
+            } catch (e) {
+              console.error("delayed push error:", e);
+              await linePush(uid, [{ type:"text", text:`遅くなってごめん、${getCallName(uid)}。もう大丈夫！` }]).catch(()=>{});
+            } finally {
+              delayTimers.delete(uid);
+            }
+          }, randomDelayMs());
+
+          delayTimers.set(uid, toId);
+          continue; // ここでは通常返信しない
+        }
+
+        // ===== 即時の定型 =====
+        if (/おはよ|おはよう/i.test(t)) {
+          await lineReply(ev.replyToken, [{ type: "text", text: `おはよう、${getCallName(uid)}。今日もがんばろうね。` }]);
+          continue;
+        }
+        if (/おつかれ|お疲れ/i.test(t)) {
+          await lineReply(ev.replyToken, [{ type: "text", text: `お疲れさま、${getCallName(uid)}。無理しすぎないでね。` }]);
+          continue;
+        }
+        if (/おやすみ/i.test(t)) {
+          await lineReply(ev.replyToken, [{ type: "text", text: `おやすみ、${getCallName(uid)}。ゆっくり休んでね。` }]);
+          continue;
+        }
+
+        // ===== GPT（即時） =====
+        const ai = await gptReply(t, { callName: getCallName(uid) });
         await lineReply(ev.replyToken, [{ type: "text", text: ai }]);
       }
     } catch (e) {
