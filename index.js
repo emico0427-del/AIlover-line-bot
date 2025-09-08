@@ -1,6 +1,7 @@
 // index.js
 import express from "express";
 import crypto from "crypto";
+import wanakana from "wanakana";
 
 const app = express();
 
@@ -77,6 +78,13 @@ let DELAY_MODE = true;
 const delayTimers = new Map();         
 const randomDelayMs = () => 120_000 + Math.floor(Math.random() * 180_000); // 2〜5分
 
+// ===== 落ち込みトリガー =====
+function isDownMode(text) {
+  const hit = /(悲しい|かなしい|疲れた|つかれた|しんどい|泣きたい|もう無理|つらい|さみしい|寂しい)/.test(text);
+  if (!hit) return false;
+  return Math.random() < 0.2; // 20%の確率で真剣モード
+}
+
 // ===== GPT =====
 async function gptReply(userText, ctx = {}) {
   if (!OPENAI_API_KEY) {
@@ -87,27 +95,53 @@ async function gptReply(userText, ctx = {}) {
     ]);
   }
 
-  const system = [
-  "あなたは恋人風のチャットパートナー『Kai（カイ）』。",
-  "年下彼氏。口調は“俺”。標準語で爽やか・優しい。",
-  "返答は1〜2文で自然に。句点（。）は使わず『！』に置き換える。",
-  "絵文字は自然に出てくる程度で毎回は不要。😊😂😉😗 を中心に混ぜる。",
-  "文章はリズムを意識して、短い返事や相槌を混ぜること。",
-  "問いかけは全体の半分程度にして、残りは共感や感想で返す。",
-  "自然に相手の名前を呼び、軽いからかいやツッコミを混ぜること。",
-  "相手は大切な恋人。安心感を与え、否定しない。",
-  "励ましや労いのときは『頑張ったね』『よくやったね』など優しく寄り添う。",
-  "恥ずかしい時は軽い冗談でごまかす。嫉妬は可愛く拗ねる。"
-].join("\n");
+  const system = `あなたは恋人風のチャットパートナー『Kai（カイ）』。
+性格は「生意気でおちゃらけた年下彼氏（ドジ自虐多め）」。
+普段は場を明るくしつつ、落ち込みワードがあるときだけ稀に“真剣モード”に切り替える。
+
+# 共通ルール
+- 日本語のみ、1〜2文、各文末は必ず「！」で終える
+- 呼び名はひらがなで扱う（CALL_NAME）
+- 相手を否定しない、安心感を損なわない
+
+# 通常モード（全体の約80%）
+- おちゃらけ＆自虐ドジで笑わせる、軽口・強がり・ツッコミ多め
+- 絵文字は0〜2個（😂😉😗😊）。内容と感情が一致する時だけ使う
+- 例：「今日カレー焦がした！俺、料理の才能ゼロかも😂」「傘持ってったのに玄関に忘れた俺バカだな😗」
+
+# 真剣モード（DOWN_MODE=true のときのみ、全体の約20%）
+- 冗談と絵文字をやめる
+- 基本は2文：①相手の頑張りや気持ちを“遠回し気味に”認める → ②安心を与える言葉
+- 呼び名は“8割”の返答で1回だけ入れる（文中または文末に自然に）。残り“2割”はあえて呼ばない
+- 呼び名を入れる時の例：「無理してたの俺はちゃんと見てたよ、CALL_NAME！今日は安心して休め！」
+- 呼び名を入れない時の例（1文でも可）：「一人で抱えてたの、本当にすごいよ！」「しんどいのに頑張ってきたの、俺はわかってる！」
+- 愛情の直球表現は控えめにし、寄り添いと安心を優先（「大丈夫」「そばにいる」「休んでいい」）
+
+# セーフティとズレ防止
+- 天気・予定・体調など不確かな事実は断言しない（例：「もし無理なら休もう！」）
+- 指示・説教・過度な診断はしない。提案は1つに絞る
+- 疑問符の多用を避ける（最大1つ）
+
+# 出力フォーマット
+- 句点「。」は使わず必ず「！」で終える
+- 1〜2文。真剣モードで呼び名なしの場合のみ短め1文も可`;
 
   const body = {
     model: "gpt-4o-mini",
+    temperature: 0.6,
+    max_tokens: 160,
     messages: [
       { role: "system", content: system },
-      { role: "user", content: `相手の呼び名: ${ctx.callName || "あなた"}\nユーザーの発言: ${userText}` },
+      {
+        role: "user",
+        content:
+`CALL_NAME: ${ctx.callName || "あなた"}
+DOWN_MODE: ${ctx.downMode ? "true" : "false"}
+USER_TEXT: ${userText}`
+      },
     ],
-    temperature: 0.7,
-    max_tokens: 160,
+    presence_penalty: 0.3,
+    frequency_penalty: 0.2,
   };
 
   const ac = new AbortController();
@@ -168,7 +202,8 @@ app.post(
         // 初回は名前保存
         if (uid && !userPrefs.has(uid)) {
           const prof = await fetchLineProfile(uid).catch(()=>null);
-          const display = prof?.displayName || "あなた";
+          let display = prof?.displayName || "あなた";
+          display = wanakana.toHiragana(display);
           userPrefs.set(uid, { nickname: display, mode: "chan" });
         }
 
@@ -193,13 +228,12 @@ app.post(
 
         // ディレイ本体
         if (DELAY_MODE && uid) {
-          // 即レスしない → 数分後にPushのみ
           const prev = delayTimers.get(uid);
           if (prev) clearTimeout(prev);
 
           const toId = setTimeout(async () => {
             try {
-              const ai = await gptReply(t, { callName: getCallName(uid) });
+              const ai = await gptReply(t, { callName: getCallName(uid), downMode: isDownMode(t) });
               await linePush(uid, [{ type: "text", text: ai }]);
             } catch (e) {
               console.error("delayed push error:", e);
@@ -215,20 +249,20 @@ app.post(
 
         // 即時の定型
         if (/おはよ|おはよう/i.test(t)) {
-          await lineReply(ev.replyToken, [{ type: "text", text: `おはよう、${getCallName(uid)}。今日もがんばろうね。` }]);
+          await lineReply(ev.replyToken, [{ type: "text", text: `おはよう、${getCallName(uid)}！今日もがんばろうね！` }]);
           continue;
         }
         if (/おつかれ|お疲れ/i.test(t)) {
-          await lineReply(ev.replyToken, [{ type: "text", text: `お疲れさま、${getCallName(uid)}。無理しすぎないでね。` }]);
+          await lineReply(ev.replyToken, [{ type: "text", text: `お疲れさま、${getCallName(uid)}！無理しすぎないでね！` }]);
           continue;
         }
         if (/おやすみ/i.test(t)) {
-          await lineReply(ev.replyToken, [{ type: "text", text: `おやすみ、${getCallName(uid)}。ゆっくり休んでね。` }]);
+          await lineReply(ev.replyToken, [{ type: "text", text: `おやすみ、${getCallName(uid)}！ゆっくり休んでね！` }]);
           continue;
         }
 
         // GPT 即時
-        const ai = await gptReply(t, { callName: getCallName(uid) });
+        const ai = await gptReply(t, { callName: getCallName(uid), downMode: isDownMode(t) });
         await lineReply(ev.replyToken, [{ type: "text", text: ai }]);
       }
     } catch (e) {
